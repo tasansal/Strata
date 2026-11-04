@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
 #pragma unroll
     for (int i = 0; i < RPW; ++i)
         if (rowoff[i] >= 0) {
-            const uint8_t* r = ckv + (size_t) rowoff[i] * ckv_row_bytes;
+            const uint8_t* r = ckv + (ar.gen ? 0 : ar.cboff[t]) + (size_t) rowoff[i] * ckv_row_bytes;
             cwv[i] = *(const uint2*) (r + lane * 8);
             sbv[i] = r[D / 2 + lane];
         }

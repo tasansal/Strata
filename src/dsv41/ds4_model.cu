@@ -3211,7 +3211,7 @@ struct Model::Impl {
                       dalloc(d, d.freqs_win, 64, err) && dalloc(d, d.freqs_comp, 64, err) &&
                       dalloc(d, d.topk, W * topk_stride(), err) && dalloc(d, d.cand, W * cand_stride(), err) &&
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
-                      dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
+                      dalloc(d, d.ext, std::max((size_t) g.win + W, W * (g.win + 1)) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
         if (ok && ds4_dbg("DS4_DBG_DEVH"))
@@ -13864,6 +13864,189 @@ struct Model::Impl {
         }
         return true;
     }
+    // (--parallel) layer l's attention for a multi step of one token per conversation - row t conversation wp.rseq[t]'s
+    // at position wp.rpos[t] - in one pass: attn_core's kernels once for all the rows instead of once a row.  Each row
+    // reads its own conversation's ring (a block of win + 1 rows of ext: its ring, then its row) and, through per-row byte
+    // offsets from conversation 0's buffers (AttnRows::cboff, Rows::kboff, Finish::pdst_off), its own compressed KV
+    // and index keys; each completed group goes to its own conversation's rows.  The same sums as attn_core's, row by row
+    bool attn_rows(Layer& l, int mi, Dev& d, int T, const WinPlan& wp, const Layer& L0, std::string& err) {
+        cudaStream_t s = d.st;
+        const int D = g.dim, HD = g.hd, NHL = l.ahn, HQ = NHL * HD;
+        const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        const auto set_rows = [&](Finish& f) {
+            f.rows = T;
+            for (int t = 0; t < T; ++t) f.pos_rows[t] = (int) wp.rpos[t];
+        };
+        const auto off = [](const uint8_t* p, const uint8_t* base) { return (long long) ((intptr_t) p - (intptr_t) base); };
+        std::vector<AttnSeq> A((size_t) T);
+        for (int t = 0; t < T; ++t) A[(size_t) t] = attn_seq(L0, mi, wp.rseq[t]);
+        const size_t rblk = (size_t) (g.win + 1) * HD;
+        for (int t = 0; t < T; ++t) ring_to_ext(A[(size_t) t].win, d.ext + (size_t) t * rblk, wp.rpos[t], g.win, HD, s);
+        Finish fk;
+        fk.w = l.kv_norm;
+        fk.eps = g.eps;
+        fk.rd = g.rd;
+        fk.freqs = freqs;
+        fk.quant = 1;
+        fk.dst = d.ext + (size_t) g.win * HD;
+        fk.dst_stride = (long long) rblk;
+        set_rows(fk);
+        finish(d.kvr, T, HD, HD, fk, s);
+        for (int t = 0; t < T; ++t) ext_to_ring(d.ext + (size_t) t * rblk, A[(size_t) t].win, wp.rpos[t], g.win, 1, HD, s);
+        AttnRows ar;
+        for (int t = 0; t < T; ++t) {   // (its block's row of position max(0, p - win + 1), through its own)
+            const int first = (int) std::max<int64_t>(g.win - wp.rpos[t], 1);
+            ar.win0[t] = t * (g.win + 1) + first;
+            ar.nwin[t] = g.win - first + 1;
+            ar.nsel[t] = 0;
+        }
+        const void* ckv = nullptr;
+        if (l.ratio > 0) {
+            Src& sr = srcs[(size_t) l.src];
+            const int R = l.ratio;
+            const uint8_t* ckv0 = sqs[0].ckv[(size_t) l.src][(size_t) l.dev];
+            int gk[kWin], gt[kWin], ng = 0;   // the rows that complete a group (in row order): the group, its row
+            for (int t = 0; t < T; ++t)
+                if ((wp.rpos[t] + 1) % R == 0) {
+                    gk[ng] = (int) (wp.rpos[t] / R);
+                    gt[ng++] = t;
+                }
+            if (l.kv_src) {
+                if (R == 1) {
+                    Finish fc;
+                    fc.w = l.c_norm;
+                    fc.eps = g.eps;
+                    finish(d.ckr, T, HD, HD, fc, s);
+                    CK(cudaMemcpyAsync(d.latent, d.ckr, (size_t) T * HD * 4, cudaMemcpyDeviceToDevice, s));
+                } else
+                    for (int t = 0, k = 0; t < T; ++t) {
+                        compress_win(d.ckr + (size_t) t * HD, d.cgr + (size_t) t * HD, A[(size_t) t].c_kv,
+                                     A[(size_t) t].c_score, R, (int) wp.rpos[t], 1, HD, l.c_norm, g.eps,
+                                     d.latent + (size_t) k * HD, s);
+                        if ((wp.rpos[t] + 1) % R == 0) ++k;
+                    }
+            }
+            Rows lim;
+            int clen_max = 0;
+            for (int t = 0; t < T; ++t) {
+                lim.n[t] = (int) ((wp.rpos[t] + 1) / R);
+                lim.k[t] = std::min(g.ix_topk, lim.n[t]);
+                clen_max = std::max(clen_max, lim.n[t]);
+            }
+            if (l.ix_src) {
+                Src& ks = srcs[(size_t) l.ik_src];
+                const uint8_t* ik0 = sqs[0].ik[(size_t) l.ik_src][(size_t) l.dev];
+                for (int t = 0; t < T; ++t) lim.kboff[t] = off((*A[(size_t) t].ik)[(size_t) l.dev], ik0);
+                if (l.owns_k && ng > 0) {
+                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
+                    Finish fi;
+                    fi.w = l.ik_norm;
+                    fi.eps = g.eps;
+                    fi.rd = g.rd;
+                    fi.freqs = freqs;
+                    fi.quant = 3;
+                    fi.pdst = (uint8_t*) ik0;
+                    fi.rows = ng;
+                    for (int k = 0; k < ng; ++k) {
+                        fi.pos_rows[k] = gk[k] * R;
+                        fi.pdst_off[k] = lim.kboff[gt[k]] + (long long) gk[k] * (long long) ik_rb();
+                    }
+                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    for (int k = 0; k < ng && !wp.par; ++k) {
+                        std::vector<uint8_t*>& cp = *A[(size_t) gt[k]].ik;
+                        if (!replicate(cp, ks.h_ik + (size_t) k * ik_rb(), ks.ev_ik,
+                                       cp[(size_t) l.dev] + (size_t) gk[k] * ik_rb(), (size_t) gk[k] * ik_rb(), ik_rb(),
+                                       l.dev, err))
+                            return false;
+                    }
+                }
+                if (clen_max > 0) {
+                    if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
+                    Finish fi;
+                    fi.rd = g.rd;
+                    fi.vpp = g.ix_heads;
+                    fi.freqs = freqs;
+                    fi.quant = 3;
+                    set_rows(fi);
+                    finish(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                    gemv_f16_rows(l.i_wproj, d.x, (size_t) D, g.ix_heads, D, T,
+                                  1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), d.iw, 64, s);
+                    const long long ss = (long long) o.max_context + 64;
+                    bool restrict_ = false;
+                    for (int t = 0; t < T; ++t)
+                        restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
+                    if (l.uses_cand && restrict_) {
+                        Rows cl;
+                        int nmax = 0;
+                        for (int t = 0; t < T; ++t) {
+                            cl.n[t] = lim.n[t];
+                            cl.k[t] = wp.cand[l.il][t];
+                            cl.kboff[t] = lim.kboff[t];
+                            nmax = std::max(nmax, wp.cand[l.il][t] * g.cand_blk);
+                        }
+                        index_score(d.iq, d.iw, ik0, g.ix_heads, g.ix_hd, T, nmax, d.cand, (int) cand_stride(), g.cand_blk,
+                                    cl, d.scores, ss, s);
+                        Rows tr;
+                        for (int t = 0; t < T; ++t) {
+                            tr.n[t] = wp.cand[l.il][t] * g.cand_blk;
+                            tr.k[t] = lim.k[t];
+                        }
+                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
+                    } else {
+                        index_score(d.iq, d.iw, ik0, g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1, lim, d.scores, ss, s);
+                        if (l.cand_src) {
+                            Rows cr;
+                            for (int t = 0; t < T; ++t) {
+                                cr.n[t] = lim.n[t];
+                                cr.k[t] = g.cand_topk;
+                            }
+                            cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), d.cand,
+                                        (int) cand_stride(), s);
+                        }
+                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                    }
+                }
+            }
+            if (l.kv_src && ng > 0) {
+                Finish fc;
+                fc.rd = g.rd;
+                fc.freqs = freqs;
+                fc.quant = 2;
+                fc.pdst = (uint8_t*) ckv0;
+                fc.rows = ng;
+                for (int k = 0; k < ng; ++k) {
+                    fc.pos_rows[k] = gk[k] * R;
+                    fc.pdst_off[k] = off((*A[(size_t) gt[k]].ckv)[(size_t) l.dev], ckv0) + (long long) gk[k] * (long long) ckv_rb();
+                }
+                finish(d.latent, ng, HD, HD, fc, s);
+                for (int k = 0; k < ng && !wp.par; ++k) {
+                    std::vector<uint8_t*>& cp = *A[(size_t) gt[k]].ckv;
+                    if (!replicate(cp, sr.h_ckv + (size_t) k * ckv_rb(), sr.ev_ckv,
+                                   cp[(size_t) l.dev] + (size_t) gk[k] * ckv_rb(), (size_t) gk[k] * ckv_rb(), ckv_rb(),
+                                   l.dev, err))
+                        return false;
+                }
+            }
+            for (int t = 0; t < T; ++t) {
+                ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
+                ar.cboff[t] = off((*A[(size_t) t].ckv)[(size_t) l.dev], ckv0);
+            }
+            ckv = ckv0;
+        }
+        if (NHL > 0) {
+            sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
+                        1.0f / std::sqrt((float) HD), d.o, s, kKvFp4, 0, &d.attn_scr);
+            Finish fo;
+            fo.rd = g.rd;
+            fo.vpp = NHL;
+            fo.freqs = freqs;
+            fo.inverse = 1;
+            fo.quant = 1;
+            set_rows(fo);
+            finish(d.o, T * NHL, HD, HD, fo, s);
+        }
+        return true;
+    }
     // a multi step's new compressed rows (each row's own conversation's, a group its position completed) to the other
     // groups' readers: gathered in d.mstage, one hand-off - what a window's source puts in one piece (layer())
     bool multi_put(const Layer& l, int mi, Dev& d, const WinPlan& wp, std::string& err) {
@@ -14083,12 +14266,23 @@ struct Model::Impl {
             if (!attn_core(l, mi, d, p0, T, 0, wp, attn_bound(l), err)) return false;
         } else {   // (--parallel: each row its own conversation's attention, then its new rows to the other groups -
                    //  a conversation's run of rows, a verify window's, as that window: the k-th run's snapshot k)
-            for (int t = 0, k = 0; t < T; ++k) {
-                int u = t + 1;
-                while (u < T && wp.rseq[u] == wp.rseq[t]) ++u;
-                if (!attn_core(l, mi, d, wp.rpos[t], u - t, t, wp, attn_seq(L0, mi, wp.rseq[t]), err, k)) return false;
-                t = u;
-            }
+            // (local) a token of each conversation (step_multi: no drafts) - one pass for all of them (attn_rows);
+            // STRATA_DS4_MULTI_ROWS=0: a row at a time, as upstream
+            static const bool rows_pass = [] {
+                const char* v = std::getenv("STRATA_DS4_MULTI_ROWS");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            bool one_each = rows_pass && !spec_win && !l.mtp;
+            for (int t = 1; t < T && one_each; ++t) one_each = wp.rseq[t] != wp.rseq[t - 1];
+            if (one_each) {
+                if (!attn_rows(l, mi, d, T, wp, L0, err)) return false;
+            } else
+                for (int t = 0, k = 0; t < T; ++k) {
+                    int u = t + 1;
+                    while (u < T && wp.rseq[u] == wp.rseq[t]) ++u;
+                    if (!attn_core(l, mi, d, wp.rpos[t], u - t, t, wp, attn_seq(L0, mi, wp.rseq[t]), err, k)) return false;
+                    t = u;
+                }
             if (!multi_put(l, mi, d, wp, err)) return false;
         }
         if (NHL > 0) {

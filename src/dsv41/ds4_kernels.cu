@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
     }
     if (f.rd > 0) {
         const int r0 = len - f.rd;
-        const int pos = f.pos + (int) (blockIdx.x / f.vpp) * f.pos_step;
+        const int pos = f.rows > 0 ? f.pos_rows[blockIdx.x / f.vpp] : f.pos + (int) (blockIdx.x / f.vpp) * f.pos_step;
 #pragma unroll
         for (int j = 0; j < kFinMax; ++j) {
             if (j >= nj) break;
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
     }
     if (kPack) {   // the same roundings, written as their codes and each group's scale (the readers' q * s: r exactly)
         const int g = f.quant == 2 ? 16 : 32;
-        uint8_t* pr = f.pdst + (long long) blockIdx.x * f.pdst_stride;
+        uint8_t* pr = f.pdst + (f.rows > 0 ? f.pdst_off[blockIdx.x] : (long long) blockIdx.x * f.pdst_stride);
 #pragma unroll
         for (int j = 0; j < kFinMax; ++j) {
             if (j >= nj) break;
@@ -675,7 +675,7 @@ __global__ void __launch_bounds__(kThreads) index_score_kernel(const float* __re
         o[i] = -INFINITY;
         return;
     }
-    const uint8_t* kr = kc + (size_t) p * kv_row_bytes(KF, HD);
+    const uint8_t* kr = kc + (lim.gen ? 0 : lim.kboff[t]) + (size_t) p * kv_row_bytes(KF, HD);
     float acc[32];
 #pragma unroll
     for (int h = 0; h < 32; ++h) acc[h] = 0.0f;
@@ -878,7 +878,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
         if (threadIdx.x < nt) {
             const int j = t0 + threadIdx.x;
             rows[threadIdx.x] = j < n_win ? wbase + (size_t) j * d
-                                          : ckv + (kContig ? (size_t) t * sel_stride + (j - n_win) : (size_t) sl[j - n_win]) * d;
+                                          : (kContig ? ckv + ((size_t) t * sel_stride + (j - n_win)) * d
+                                                    : (const uint16_t*) ((const uint8_t*) ckv + (ar.gen ? 0 : ar.cboff[t])) + (size_t) sl[j - n_win] * d);
         }
         __syncthreads();
         if (kContig && kPre > 0) {   // the warp's rows of the tile (wp, wp + 8, ..), kPre loads at a time, then dots
@@ -1016,7 +1017,7 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     }
     if (i >= n_sel) return;
     const size_t r = (size_t) t * cap + i;
-    unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
+    unpack32(ckv + (ar.gen ? 0 : ar.cboff[t]) + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
 }
 
 template <int G>
@@ -1078,7 +1079,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
         const int nt = min(kAttTile, total - t0);
         if (threadIdx.x < nt) {
             const int j = t0 + threadIdx.x;
-            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (ar.gen ? 0 : ar.cboff[t]) + (size_t) sl[j - n_win] * crow;
         }
         __syncthreads();
         for (int s0 = 0; s0 < nt; s0 += kStage) {   // the dots
@@ -1235,7 +1236,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
         const int nt = min(kFaKeys, total - t0);
         if (tid < nt) {
             const int j = t0 + tid;
-            rows[tid] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * kFaD) : ckv + (size_t) sl[j - n_win] * crow;
+            rows[tid] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * kFaD) : ckv + (ar.gen ? 0 : ar.cboff[t]) + (size_t) sl[j - n_win] * crow;
         }
         __syncthreads();
         stage(t0, nt);

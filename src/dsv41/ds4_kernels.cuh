@@ -54,6 +54,11 @@ struct Finish {
     long long dst_stride = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
+    // rows (> 0, --parallel: a multi step's rows, one of each conversation): vector v's position is pos_rows[v / vpp] (pos / pos_step
+    // unused) and, packed, it goes to pdst + pdst_off[v] bytes (pdst_stride unused; at most kWin vectors then)
+    int rows = 0;
+    int pos_rows[kWin] = {};
+    long long pdst_off[kWin] = {};
 };
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s);
 
@@ -126,6 +131,7 @@ struct Rows {
     int k[kWin];
     int gen = 0, R = 1, kcap = 0, ccap = 0, blk = 1;
     long long p0 = 0;
+    long long kboff[kWin] = {};   // (--parallel, a multi step's rows) query t's keys start kboff[t] bytes from the table's pointer
 };
 
 /// The indexer's scores, row t: out[t][i] = sum_h relu(q[t][h] . k[p]) w[t][h] for i < n (the widest query's), p = i, or
@@ -157,6 +163,7 @@ struct AttnScratch {
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
+    long long cboff[kWin] = {};   // (--parallel, a multi step's rows) query t's compressed rows start cboff[t] bytes from ckv
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
     // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
