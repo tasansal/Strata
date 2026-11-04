@@ -121,6 +121,8 @@ void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h
 /// (tg / td 39: ds4_gguf.cu's experts): false (nothing launched) when it is switched off - the caller's tiles take every
 /// expert then; true: they take those of more rows (skip_le 16).
 bool light_gate_up(const SetArgs& a, cudaStream_t s);
+/// The light kernels' scratch of stream s made now (at load, before the experts take the VRAM; otherwise on first use)
+bool light_prepare(cudaStream_t s);
 bool light_down(const SetArgs& a, cudaStream_t s);
 
 /// GEMV jobs on such matrices (an expert's views on the host-routed path): y[c][r] = alpha (row r . x_c) + bias[r] for

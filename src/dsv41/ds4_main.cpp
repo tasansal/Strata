@@ -1198,8 +1198,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // token with a checkpoint before it.  `yield_fn`: the model ends a run of chunks early at a chunk every stage reaches
     // once it says true (Model::set_yield) and the piece returns with the prompt not all read.  false: the request ended
     // here (its DONE written, the conversation before it kept when it can be)
+    // (local) STRATA_DS4_CONCURRENT_READ (default on; 0: off): with --parallel, a prompt of at least STRATA_DS4_CONC_MIN
+    // (4096) unread tokens while other conversations answer is read on a thread of its own (Model::feed_beside, the
+    // devices' read streams) while this thread keeps running their rounds (`beside`), at most one every
+    // STRATA_DS4_CONC_PACE_MS (50) - instead of every answer waiting for the whole read
+    static const bool conc_read = std::getenv("STRATA_DS4_CONCURRENT_READ") == nullptr ||
+                                  std::atoi(std::getenv("STRATA_DS4_CONCURRENT_READ")) != 0;
+    static const size_t conc_min = std::getenv("STRATA_DS4_CONC_MIN")
+                                       ? (size_t) std::max(64, std::atoi(std::getenv("STRATA_DS4_CONC_MIN"))) : 4096;
+    static const double conc_pace = std::getenv("STRATA_DS4_CONC_PACE_MS")
+                                        ? std::max(0.0, std::atof(std::getenv("STRATA_DS4_CONC_PACE_MS"))) : 50.0;
+    struct Beside {
+        std::function<bool()> active;   // (answers are running)
+        std::function<void()> turn;     // (a round of them)
+    };
     const auto prompt_piece = [&](Req& r, const std::string& tag, const std::function<bool()>& stop_now, Prompt& P,
-                                  size_t piece, const std::function<bool()>& yield_fn) -> bool {
+                                  size_t piece, const std::function<bool()>& yield_fn,
+                                  const Beside* beside = nullptr) -> bool {
         const size_t total = r.ids.size();
         const size_t from = P.from;
         const double t0 = P.t0;
@@ -1224,6 +1239,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
         m.set_cancel(stop_now);
         bool stopped = false;
+        bool besided = false;   // (local: a part of this prompt read beside already - the rest goes beside too, past its points)
 
         while (ok && done < total) {
             if (stop_now()) {
@@ -1231,6 +1247,79 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             if (done - start >= piece) break;
+            // (local) a read beside the answers: up to the next restore point, else the prompt's last token (read after,
+            // as usual, for its logits and the checkpoint before it)
+            if (beside != nullptr && conc_read && P.pics.empty() && piece >= total - done && beside->active()) {
+                const size_t conc_n = next_cut < cuts.size() ? (size_t) cuts[next_cut].pos - done : total - done - 1;
+                std::string e2;
+                if (conc_n >= (besided ? (size_t) 64 : conc_min) && m.read_begin((int64_t) conc_n, e2)) {
+                    besided = true;
+                    std::atomic<int64_t> prog{0};
+                    std::atomic<bool> fin{false};
+                    bool rok = false;
+                    std::string rerr;
+                    m.set_progress([&prog](int64_t d) { prog.store(d); });   // (printed here: one thread writes stdout)
+                    const double tr = now_ms();
+                    std::thread rd([&] {
+                        rok = m.feed_beside(r.ids.data() + done, (int) conc_n, rerr);
+                        fin.store(true);
+                    });
+                    int turns = 0;
+                    double gap = 0.0, tw = now_ms();
+                    size_t pp_at = done;
+                    while (!fin.load()) {
+                        if (beside->active()) {
+                            beside->turn();
+                            ++turns;
+                            double t = now_ms();
+                            if (conc_pace > 0 && t - tw < conc_pace) {   // (paced: the read gets the GPUs and the CPU between)
+                                std::this_thread::sleep_for(
+                                    std::chrono::microseconds((int64_t) (1000.0 * (conc_pace - (t - tw)))));
+                                t = now_ms();
+                            }
+                            gap = std::max(gap, t - tw);
+                            tw = t;
+                        } else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        const size_t at = done + (size_t) prog.load();
+                        if (at >= pp_at + 64) {
+                            const double ms = now_ms() - t0;
+                            std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), at, r.ids.size(), ms,
+                                        ms > 0 ? 1000.0 * (double) (at - from) / ms : 0.0, from);
+                            std::fflush(stdout);
+                            pp_at = at;
+                        }
+                    }
+                    rd.join();
+                    std::string e3;
+                    if (!m.read_finish(e3) && rok) {
+                        rok = false;
+                        rerr = e3;
+                    }
+                    m.set_progress([&](int64_t d) {
+                        const double ms = now_ms() - t0;
+                        std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done + (size_t) d, r.ids.size(), ms,
+                                    ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
+                        std::fflush(stdout);
+                    });
+                    std::fprintf(stderr, "ds4 serve: read %zu tokens on a thread of its own in %.0f ms beside %d rounds of "
+                                         "the answers (longest gap %.0f ms)%s\n", conc_n, now_ms() - tr, turns, gap,
+                                 rok ? "" : " - it did not finish");
+                    if (!rok) {
+                        ok = false;
+                        err = rerr;
+                        break;
+                    }
+                    done += conc_n;
+                    if (next_cut < cuts.size() && done == (size_t) cuts[next_cut].pos) {
+                        const bool sh = cuts[next_cut++].shared;
+                        m.mark(sh);
+                        if (sh && from == 0 && next_cut == 1) prefix_keep();
+                    }
+                    continue;
+                }
+                if (conc_n >= conc_min)
+                    std::fprintf(stderr, "ds4 serve: no read beside the answers (%s)\n", e2.c_str());
+            }
             size_t n = std::min<size_t>({(size_t) m.feed_unit(), total - done, piece - (done - start)});
             if (next_cut < cuts.size() && (size_t) cuts[next_cut].pos < done + n) n = (size_t) cuts[next_cut].pos - done;
             // (the rest of the prompt in one read that keeps the restore points left on the way, where that costs at most
@@ -1584,6 +1673,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         // one round of the running requests: each writes its next token, the model makes the next ones (a plain step, its rounds with
         // drafts alone, or one multi step for several)
+        bool beside_read = false;   // (local: a prompt read beside - the bound conversation is the read's)
         const auto round_turn = [&]() {
         // each running request writes its next token; those whose next one the model must make go below
         std::vector<Act*> need;
@@ -1634,7 +1724,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::printf("%s\n", st.c_str());
         }
         std::fflush(stdout);
-        if (need.size() == 1) {   // alone (or the last of several still running): its rounds, as with one conversation
+        if (need.size() == 1 && !beside_read) {   // alone (or the last of several still running): its rounds, as with one conversation
             Act& a = *need[0];
             bind(a.seq);
             const int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
@@ -1654,7 +1744,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 a.tok = a.got.back();
                 a.got.pop_back();
             }
-        } else if (need.size() > 1) {   // several: a round of each through the model together
+        } else if (need.size() > 1 || (beside_read && !need.empty())) {   // several (or beside a read): a round of each through the model together
             // each one's drafts (DSpark, in one drafter pass where they fit one, else a conversation at a time: its
             // own drafter rings) while their confidence holds, its share of a window at most; then every one's token
             // and drafts through the model at once (step_multi_spec) and each its verdict (verify_multi).  No drafts
@@ -1682,7 +1772,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 Act& a = *need[(size_t) i];
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
                 rooms[(size_t) i] = room = std::min(room, share);
-                if (!(multi_spec && (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0))
+                if (beside_read || !(multi_spec && (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0))
                     continue;
                 tried[(size_t) i] = 1;
                 dsv.push_back(a.seq);
@@ -1790,8 +1880,28 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const long long rid = a.r.rid;
             std::function<bool()> y;
             if (yield) y = [&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; };
+            Beside bs;
+            bs.active = [&] {
+                for (auto& ap : acts)
+                    if (!ap->reading && !ap->done) return true;
+                return false;
+            };
+            bs.turn = [&] {   // (a round, and the answers it ended written - their conversations free, none taken meanwhile)
+                beside_read = true;
+                round_turn();
+                beside_read = false;
+                for (size_t i = 0; i < acts.size();) {
+                    if (!acts[i]->done || acts[i]->reading) {
+                        ++i;
+                        continue;
+                    }
+                    std::unique_ptr<Act> d = std::move(acts[i]);
+                    acts.erase(acts.begin() + (long) i);
+                    finish_act(*d);
+                }
+            };
             const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
-                                           piece, y);
+                                           piece, y, &bs);
             if (!read) {
                 a.ended = a.done = true;
                 return;

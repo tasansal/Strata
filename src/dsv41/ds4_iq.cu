@@ -1594,6 +1594,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
+bool light_prepare(cudaStream_t s) { return light_buf(s, 8192) != nullptr; }
 bool light_gate_up(const SetArgs& a, cudaStream_t s) {
     if (is_tq(a.tg)) return false;   // (the trellis sets take the tiles for every expert)
     if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;

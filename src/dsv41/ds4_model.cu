@@ -615,9 +615,18 @@ std::vector<float> rope_freqs(int dim, int original, double base, double factor,
 }
 
 // ------------------------------------------------------------------ devices, layers
+// a prompt read beside decoding sessions (Model::feed_beside) runs on threads of its own: there tl_read is set, and a
+// device's work goes to its read stream instead of the decode one - so the read's kernels and the decode windows'
+// interleave on the GPU instead of queueing behind each other (measured on gfx1201: a decode-like step beside
+// prompt-like kernels 7.0 -> 8.7 ms on separate streams; a stream priority did not help, at times hurt)
+inline thread_local bool tl_read = false;
+struct DevStream {
+    cudaStream_t dec = nullptr, rd = nullptr;
+    operator cudaStream_t() const { return tl_read && rd != nullptr ? rd : dec; }
+};
 struct Dev {
     int id = 0;
-    cudaStream_t st = nullptr;
+    DevStream st;
     cudaEvent_t ev = nullptr, ev2 = nullptr;   // (ev2: the lookahead's guesses are on the host)
     int* ridx_a = nullptr;                      // (Metal) the next layers' guessed picks (2 x kPicks)
     float* rw_a = nullptr;
@@ -698,6 +707,9 @@ struct Chunk {
     // Dev::tail) or their own (laid out once at the largest chunk)
     bool borrow = false;
     uint8_t* own = nullptr;
+    // a read beside decoding sessions: its own short-slab attention scratch and drafter taps (the Dev's are the decode's)
+    AttnScratch attn_scr;
+    float* tap = nullptr;
     float *h = nullptr, *x = nullptr, *acc = nullptr, *qr = nullptr, *kvr = nullptr, *ckr = nullptr, *cgr = nullptr,
           *latent = nullptr, *ikr = nullptr, *q = nullptr, *o = nullptr, *oa = nullptr, *iq = nullptr, *iw = nullptr,
           *scores = nullptr, *bm = nullptr, *mix = nullptr, *a_pre = nullptr, *a_post = nullptr, *a_comb = nullptr,
@@ -1079,7 +1091,7 @@ struct Model::Impl {
         return all_gfx12 == 1;
     }
     bool prompt_par = false;          // the prompt path's chunks (a thread a GPU), as --tp / --threads asked
-    unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
+    std::atomic<unsigned> win_seq{0};   // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
@@ -1300,6 +1312,13 @@ struct Model::Impl {
     Stats st;
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
                                                         // (plan_window's: the windows' plans are made in order)
+    // a prompt read beside decoding sessions (feed_beside): read_live while it runs (the expert cache commits no swap,
+    // step_rows leaves the current session - the read's - alone); its taps and the seeding / cache tick it leaves for
+    // read_finish; chunk_nl: the chunk path's logits rows (n_logits is the decode windows')
+    std::atomic<bool> read_live{false};
+    float* h_taps_rd = nullptr;
+    int64_t rd_seed_p0 = 0, rd_tokens = 0;
+    int rd_seed_n = 0, chunk_nl = 0;
     int n_logits = 0;                 // the last forward's logit rows
     // the decode path (windows of one): the device publishes each layer's routing into reqs, the service thread
     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
@@ -1944,7 +1963,8 @@ struct Model::Impl {
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
-            if (d.st) cudaStreamDestroy(d.st);
+            if (d.st.dec) cudaStreamDestroy(d.st.dec);
+            if (d.st.rd) cudaStreamDestroy(d.st.rd);
             if (d.ev) cudaEventDestroy(d.ev);
         }
         for (void* p : host_allocs) cudaFreeHost(p);
@@ -2680,11 +2700,19 @@ struct Model::Impl {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(cudaSetDevice(d.id));
-            CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&d.st.dec, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&d.st.rd, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&d.ev2, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
+                return false;
+            }
+            // the read stream's (a prompt read beside decoding sessions) and the light kernels' of both: made now, before
+            // the experts take the VRAM - made on first use, a full card refuses them
+            (void) gg::iq::light_prepare(d.st.dec);
+            if (o.seqs > 1 && (!x3::prepare(d.st.rd) || (pk.gguf && !gg::prepare(d.st.rd)) || !gg::iq::light_prepare(d.st.rd))) {
+                err = "the read stream's scratch on CUDA" + std::to_string(d.id);
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
@@ -3294,6 +3322,7 @@ struct Model::Impl {
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
+            if (!halloc(h_taps_rd, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
             CK(cudaSetDevice(devs[(size_t) d_dev].id));
             CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
             CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
@@ -4147,12 +4176,25 @@ struct Model::Impl {
                 CK(cudaEventCreateWithFlags(&c.filled[i], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&c.freed[i], cudaEventDisableTiming));
             }
+            c.attn_scr.max_t = kAttnScratchT;
+            c.attn_scr.cap = (int) topk_stride();
+            if (!dalloc(d, c.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
+            if (g.n_mtp > 0 && !dalloc(d, c.tap, (size_t) tap_cap * g.dim, err)) return false;
             if (cublasCreate(&c.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(c.blas, d.st) != CUBLAS_STATUS_SUCCESS) {
                 err = "cuBLAS on CUDA" + std::to_string(d.id);
                 return false;
             }
             // (the hand-offs between groups: none where one group holds every layer - a chunk's h alone is 80 KB a row)
             const bool hands = d.mi == 0 && groups.size() > 1;
+#if defined(__HIP_PLATFORM_AMD__)
+            if (std::getenv("DS4_BLAS_NO_ATOMICS") != nullptr) {   // (tests: rocBLAS's split-K atomics off - their sums' order follows the GPU's timing)
+#if hipblasVersionMajor == 0
+                (void) rocblas_set_atomics_mode(c.blas, rocblas_atomics_not_allowed);
+#else
+                (void) hipblasSetAtomicsMode(c.blas, HIPBLAS_ATOMICS_NOT_ALLOWED);
+#endif
+            }
+#endif
             for (int sl = 0; sl < 2; ++sl) {
                 if (hands && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
                 if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
@@ -7113,6 +7155,55 @@ struct Model::Impl {
         return sqs.empty() || s == sq_bound ? toks : sqs[(size_t) s].toks;
     }
 
+    // ---- (local, --parallel) a prompt read beside decoding conversations (the serve loop's thread: read_begin, then
+    // another thread feed_beside, then read_finish after it; step_multi for the other conversations runs meanwhile)
+    bool read_begin(int64_t n, std::string& err) {
+        if (chunk <= 0 || par || sqs.empty()) {
+            err = "a read beside the decode needs --parallel, the chunked prompt path and the single-thread decode";
+            return false;
+        }
+        for (const auto& cp : chunks)
+            if (cp != nullptr && cp->borrow) {   // (the chunks' room lent from the experts' slots the decode reads)
+                err = "the prompt path borrows the experts' room on this PC";
+                return false;
+            }
+        if (pos + n > o.max_context) {
+            err = "the context is full";
+            return false;
+        }
+        cudaSetDevice(devs[(size_t) head_dev].id);
+        const size_t nc = (size_t) ((n + chunk - 1) / chunk) + 1;
+        while (chunk_done.size() < nc) {   // (its chunks' events made here too)
+            cudaEvent_t e = nullptr;
+            CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            chunk_done.push_back(e);
+        }
+        for (Dev& d : devs) {   // (the conversation's state, as the decode stream left it, before the read stream reads it)
+            cudaSetDevice(d.id);
+            CK(cudaStreamSynchronize(d.st.dec));
+        }
+        rd_tokens = 0;
+        rd_seed_n = 0;
+        read_live.store(true);
+        return true;
+    }
+    bool feed_beside(const int* tk, int n, std::string& err) {
+        tl_read = true;
+        pm.last = -1;
+        halted = false;
+        const bool ok = forward_chunks(tk, n, 0, err);
+        tl_read = false;
+        return ok;
+    }
+    bool read_finish(std::string& err) {
+        read_live.store(false);
+        if (rd_tokens <= 0) return true;
+        const int64_t n = rd_tokens;
+        rd_tokens = 0;
+        cache_tick((int) std::min<int64_t>(n, INT_MAX));
+        return rd_seed_n <= 0 || seed_drafter(rd_seed_p0, rd_seed_n, 0, err, h_taps_rd);
+    }
+
     void reset() {
         pos = 0;
         toks.clear();
@@ -8800,6 +8891,7 @@ struct Model::Impl {
                          (long long) (st.swaps - s0), now_ms() - t0, cancel.load() ? 1 : 0);
     }
     void cache_tick(int T) {
+        if (read_live.load()) return;   // (local: a prompt read beside the decode - its slot plan stays as it is)
         tick_begin();
         rc_tick();
         cache_tick_swaps(T);
@@ -10750,7 +10842,8 @@ struct Model::Impl {
     // and each block's wkv / kv_norm / rope / FP8, for the positions the trunk kept.  draft() runs the block [y, noise x
     // (block - 1)] at positions pos .. through the blocks (each query attending to the ring and to the whole block),
     // the trunk's head, the markov bias token by token (greedy) and the confidence head.
-    bool seed_drafter(int64_t p0, int n, int row0, std::string& err) {
+    bool seed_drafter(int64_t p0, int n, int row0, std::string& err, const float* taps = nullptr) {
+        if (taps == nullptr) taps = h_taps;
         if (g.n_mtp == 0 || n <= 0) return true;
         if (n > kWin * kPicks) {
             err = "seeding the drafter with " + std::to_string(n) + " rows";
@@ -10767,12 +10860,12 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             const int64_t hdr[4] = {'S', p0, n, (int64_t) nt * D};
             std::fwrite(hdr, 8, 4, dump_d);
-            std::fwrite(h_taps + (size_t) row0 * nt * D, 4, (size_t) n * nt * D, dump_d);
+            std::fwrite(taps + (size_t) row0 * nt * D, 4, (size_t) n * nt * D, dump_d);
             std::fflush(dump_d);
         }
         for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
             const int na = std::min(kWin, n - a);
-            CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
+            CK(cudaMemcpyAsync(d.xe, taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
                                cudaMemcpyHostToDevice, d.st));
             if (!mv(d, {job(d_main_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
         }
@@ -11624,7 +11717,7 @@ struct Model::Impl {
             ar.R = l.ratio;
             ar.kcap = g.ix_topk;
             sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
-                        na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+                        na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, tl_read ? &c.attn_scr : &d.attn_scr);   // (a short last slab)
             prof_mark(d, 9);
             if (a0 == 0 && na == T) dump_sub(d, "o", l.il, p0, T, c.o, (size_t) T * HQ * 4);
             Finish fo;
@@ -11764,7 +11857,8 @@ struct Model::Impl {
                 const int v = L0.vs_pin[e];
                 const int cnt = b[(size_t) v + 1] - b[(size_t) v];
                 pr[e] += (uint32_t) cnt;
-                if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
+                if (cnt > 0 && !tl_read) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits;
+                                             //  local: not beside decoding conversations - the CPU lane writes them meanwhile)
                     ++n_picked;
                     l.heat[(size_t) e] += (float) cnt;
                     if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
@@ -11991,10 +12085,11 @@ struct Model::Impl {
                     if (it != g.d_targets.end()) {
                         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
                         const int nr = std::min(T, tap_cap);
-                        hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
-                        CK(cudaStreamWaitEvent(s, ev_seed, 0));
-                        CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4,
-                                             (size_t) nr, cudaMemcpyDeviceToHost, s));
+                        float* tp = tl_read ? c.tap : d.tap;   // (beside decoding sessions: the read's own taps, seeded after it)
+                        hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, tp, D, s);
+                        if (!tl_read) CK(cudaStreamWaitEvent(s, ev_seed, 0));
+                        CK(cudaMemcpy2DAsync((tl_read ? h_taps_rd : h_taps) + j * D, nt * D * 4, tp, (size_t) D * 4,
+                                             (size_t) D * 4, (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
                 const bool kvo = run.kv_only(k, il);
@@ -12022,10 +12117,10 @@ struct Model::Impl {
                                            (size_t) nr * g.vocab * 4, cudaMemcpyDeviceToHost, s));
                         CK(cudaStreamSynchronize(s));
                     }
-                } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
-                    const int t0 = T - n_logits;
-                    hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, s);
-                    if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
+                } else if (last_k && chunk_nl > 0) {   // (the last rows' logits, into the window path's buffers)
+                    const int t0 = T - chunk_nl;
+                    hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, chunk_nl, g.eps, d.x, s);
+                    if (!head_share(d, d.mi, d.x, chunk_nl, err)) return false;
                 }
             }
             lm_layers.store((int) li + 1, std::memory_order_release);
@@ -12212,10 +12307,11 @@ struct Model::Impl {
                     if (it != g.d_targets.end()) {
                         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
                         const int nr = std::min(T, tap_cap);
-                        hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
-                        CK(cudaStreamWaitEvent(s, ev_seed, 0));
-                        CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4,
-                                             (size_t) nr, cudaMemcpyDeviceToHost, s));
+                        float* tp = tl_read ? c.tap : d.tap;   // (beside decoding sessions: the read's own taps, seeded after it)
+                        hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, tp, D, s);
+                        if (!tl_read) CK(cudaStreamWaitEvent(s, ev_seed, 0));
+                        CK(cudaMemcpy2DAsync((tl_read ? h_taps_rd : h_taps) + j * D, nt * D * 4, tp, (size_t) D * 4,
+                                             (size_t) D * 4, (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
@@ -12247,10 +12343,10 @@ struct Model::Impl {
                                            (size_t) nr * g.vocab * 4, cudaMemcpyDeviceToHost, s));
                         CK(cudaStreamSynchronize(s));
                     }
-                } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
-                    const int t0 = T - n_logits;
-                    hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, s);
-                    if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
+                } else if (last_k && chunk_nl > 0) {   // (the last rows' logits, into the window path's buffers)
+                    const int t0 = T - chunk_nl;
+                    hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, chunk_nl, g.eps, d.x, s);
+                    if (!head_share(d, d.mi, d.x, chunk_nl, err)) return false;
                 }
             }
         }
@@ -12974,7 +13070,8 @@ struct Model::Impl {
             }
         }
         const int T_last = run.T.back();
-        n_logits = logits_all ? 0 : std::min(logits_rows, T_last);
+        chunk_nl = logits_all ? 0 : std::min(logits_rows, T_last);
+        if (!tl_read) n_logits = chunk_nl;   // (beside decoding sessions: no logits - the caller reads the last token after)
         const double tl = now_ms();
         {   // each chunk's end on the head device, for the progress reports
             cudaSetDevice(devs[(size_t) head_dev].id);
@@ -13006,11 +13103,19 @@ struct Model::Impl {
         }
         bool halting = false, stopping = false;
         run_yields = yield_to != nullptr && !lm && !logits_all;
-        for (size_t di = 0; di < devs.size(); ++di)
-            workers[di]->submit([this, di, &run, &errs] {
+        const bool rd = tl_read;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            if (chunks[di] && chunks[di]->blas) {
+                cudaSetDevice(devs[di].id);
+                cublasSetStream(chunks[di]->blas, devs[di].st);   // (local: the read's stream beside decoding conversations)
+            }
+            workers[di]->submit([this, di, &run, &errs, rd] {
+                tl_read = rd;
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) errs[di] = e.empty() ? "a device's thread failed" : e;
+                tl_read = false;
             });
+        }
         size_t reported = 0;
         for (;;) {
             bool all = true;
@@ -13174,6 +13279,26 @@ struct Model::Impl {
         }
         pos += took;
         st.tokens += took;
+        if (tl_read) {   // (local) beside decoding conversations: every device's read stream done; the expert cache's
+            // tick and the drafter's seeding wait for the caller's thread (read_finish), which owns them
+            for (Dev& dv : devs) {
+                cudaSetDevice(dv.id);
+                CK(cudaStreamSynchronize(dv.st));
+            }
+            if (lm_end_.on) {
+                lm_end();
+                lm_end_.on = false;
+            }
+            rd_seed_n = std::min(T_last, tap_cap);
+            rd_seed_p0 = pos - rd_seed_n;
+            rd_tokens = took;
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (chunks[di] && chunks[di]->blas) {
+                    cudaSetDevice(devs[di].id);
+                    cublasSetStream(chunks[di]->blas, devs[di].st.dec);
+                }
+            return true;
+        }
         cache_tick(took);
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
@@ -14729,7 +14854,26 @@ struct Model::Impl {
                 return false;
             }
         }
-        seq_park();   // (every conversation's host state in sqs while the rows run)
+        // (local) a prompt read beside: the bound conversation is the read's - its host state, drafter rings and
+        // carried indexer sizes stay as they are, and none of the rows may be it; otherwise it is parked like the others
+        const bool keep_bound = read_live.load();
+        for (int i = 0; keep_bound && i < n; ++i)
+            if (sv[i] == sq_bound) {
+                err = "conversation " + std::to_string(sq_bound) + " is reading a prompt";
+                return false;
+            }
+        int keep_topk[kWin], keep_cand[kWin];
+        std::memcpy(keep_topk, cur_topk_n, sizeof keep_topk);
+        std::memcpy(keep_cand, cur_cand_n, sizeof keep_cand);
+        const auto unpark = [&] {
+            if (!keep_bound) {
+                seq_unpark();
+                return;
+            }
+            std::memcpy(cur_topk_n, keep_topk, sizeof keep_topk);
+            std::memcpy(cur_cand_n, keep_cand, sizeof keep_cand);
+        };
+        if (!keep_bound) seq_park();   // (every conversation's host state in sqs while the rows run)
         WinPlan& wp = wplan;
         wp.nrow = T;
         std::vector<int> tk((size_t) T);
@@ -14787,7 +14931,7 @@ struct Model::Impl {
                 err = std::string("the multi step: ") + cudaGetErrorString(se);
                 wp.nrow = 0;
                 mruns.clear();
-                seq_unpark();
+                unpark();
                 return false;
             }
             prof_collect();
@@ -14811,7 +14955,7 @@ struct Model::Impl {
         }
         mrows.assign(wp.rseq, wp.rseq + T);
         wp.nrow = 0;
-        seq_unpark();
+        unpark();
         return ok;
     }
 
@@ -15182,6 +15326,9 @@ const std::vector<int32_t>& Model::seq_tokens(int s) const { return p_->seq_toke
 bool Model::step_multi(const int* seqs, const int* tokens, int n, std::string& err) {
     return p_->step_multi(seqs, tokens, n, err);
 }
+bool Model::read_begin(int64_t n, std::string& err) { return p_->read_begin(n, err); }
+bool Model::feed_beside(const int* tokens, int n, std::string& err) { return p_->feed_beside(tokens, n, err); }
+bool Model::read_finish(std::string& err) { return p_->read_finish(err); }
 int Model::sample_multi(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample_multi(row, t, tp, tk, mp, seed, counter);
 }

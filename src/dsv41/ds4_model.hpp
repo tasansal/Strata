@@ -228,6 +228,15 @@ public:
     int verify_max() const;   // the rows a window or a multi step takes at most
 
     void reset();
+    /// (local, --parallel) A prompt read beside decoding conversations: read_begin(n) on the serve thread (the bound
+    /// conversation takes the n tokens: the decode stream drained); then feed_beside(tokens, n) on a thread of its own -
+    /// the chunked path on the devices' read streams, no logits - while step_multi decodes the other conversations on
+    /// the serve thread (none of its rows the bound one; the expert cache commits no swap meanwhile); after it ends,
+    /// read_finish() on the serve thread (the cache's tick, the drafter seeded from the read's last rows).  The caller
+    /// reads the prompt's last token with feed() after, for its logits.  Nothing else may run on the model meanwhile.
+    bool read_begin(int64_t n, std::string& err);
+    bool feed_beside(const int* tokens, int n, std::string& err);
+    bool read_finish(std::string& err);
     /// The post-prompt cache settle run on a thread of its own while the server waits for its next request (WP-8's option 1):
     /// the swap rounds of cache_settle without the store preload, stopped early when `cancel` goes true.  `done` is set when
     /// the thread has nothing left to do.  Only one such run at a time; the caller joins the thread after setting cancel.
