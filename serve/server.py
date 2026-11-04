@@ -2601,6 +2601,8 @@ class StrataEngine:
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
+                elif line.startswith("STAT "):            # (local: the DeepSeek engine's running totals for this answer)
+                    self._last_stat = line.strip()
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
                         read_to = self.reused = int(line.split()[1])
@@ -2609,6 +2611,9 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if getattr(self, "_last_stat", None):   # (local: log the answer's expert placement / drafts)
+                        print(f"[stat] {self._last_stat}", file=sys.stderr, flush=True)
+                        self._last_stat = None
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return

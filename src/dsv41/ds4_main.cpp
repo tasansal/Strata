@@ -1660,6 +1660,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // and drafts through the model at once (step_multi_spec) and each its verdict (verify_multi).  No drafts
             // this round: a token of each
             const int nn = (int) need.size(), share = m.verify_max() / nn;
+            // (local) STRATA_DS4_MULTI_SPEC=0: no drafts while two or more decode together (a token of each a step; each
+            // drafts again once it runs alone).  On 4 R9700 with a CPU lane the drafts' extra rows cost more than they win
+            static const bool multi_spec = [] {
+                const char* v = std::getenv("STRATA_DS4_MULTI_SPEC");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
             const auto cancel_all = [&] {
                 std::fprintf(stderr, "ds4: %s\n", err.c_str());
                 for (Act* a : need) {
@@ -1676,7 +1682,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 Act& a = *need[(size_t) i];
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
                 rooms[(size_t) i] = room = std::min(room, share);
-                if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
+                if (!(multi_spec && (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0))
+                    continue;
                 tried[(size_t) i] = 1;
                 dsv.push_back(a.seq);
                 dys.push_back(a.tok);
